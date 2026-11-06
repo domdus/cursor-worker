@@ -1,0 +1,11 @@
+[project]
+name = "cursor-worker"
+version = "0.1.0"
+description = "Headless Cursor SDK agent as a Docker service: MCP tool, job API and OpenAI-compatible chat."
+license = "MIT"
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
