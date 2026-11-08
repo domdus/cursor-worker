@@ -12,17 +12,82 @@ It has three ways in, all on one port and protected by one token:
 
 It runs on the official [Cursor SDK](https://cursor.com/docs) with your own `CURSOR_API_KEY`. Usage is billed to that Cursor account.
 
-## Start
+## Installation
+
+You need Docker with Compose and a Cursor user API key from [cursor.com/dashboard/integrations](https://cursor.com/dashboard/integrations). The image `ghcr.io/domdus/cursor-worker` is built for amd64 and arm64. While the repository is private, the image is too: run `docker login ghcr.io` first, with a GitHub token that has `read:packages`.
+
+### 1. Make a folder with two files
 
 ```bash
-cp .env.example .env
-# paste CURSOR_API_KEY, then:
-echo "WORKER_TOKEN=$(openssl rand -hex 32)" >> .env
-docker compose up -d
-curl http://127.0.0.1:8787/health
+mkdir cursor-worker && cd cursor-worker
 ```
 
-The compose file publishes the port on `127.0.0.1` only. To reach the worker from other machines, change it to `"8787:8787"`. Every request except `/health` needs `Authorization: Bearer $WORKER_TOKEN`.
+`.env` (keep it private, it holds both secrets):
+
+```bash
+CURSOR_API_KEY=key_...
+WORKER_TOKEN=          # fill with: openssl rand -hex 32
+CURSOR_MODEL=composer-2.5
+```
+
+`docker-compose.yml`:
+
+```yaml
+services:
+  cursor-worker:
+    image: ghcr.io/domdus/cursor-worker:latest   # or pin a version, e.g. :0.2.0
+    container_name: cursor-worker
+    env_file: .env
+    ports:
+      - "127.0.0.1:8787:8787"     # this machine only; "8787:8787" opens it to your LAN
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - cursor-worker-data:/data  # jobs, sessions, workspaces
+      # A project on the host as the default workspace (writable for uid 1000),
+      # plus WORKSPACE_DIR=/workspace in .env:
+      # - /path/to/project:/workspace
+      # SSH to your servers (see "SSH to your servers"):
+      # - ./ssh:/run/secrets/ssh:ro
+    restart: unless-stopped
+
+volumes:
+  cursor-worker-data:
+```
+
+All other settings go into `.env`. [.env.example](.env.example) lists every one of them with a short explanation.
+
+### 2. Start it and check it
+
+```bash
+docker compose up -d
+curl http://127.0.0.1:8787/health
+curl -s http://127.0.0.1:8787/v1/models -H "Authorization: Bearer $(grep ^WORKER_TOKEN= .env | cut -d= -f2)"
+```
+
+`/health` answers without a token. Every other request needs `Authorization: Bearer <WORKER_TOKEN>`. `/v1/models` should list the models of your Cursor account. If it lists only `CURSOR_MODEL`, the worker could not reach Cursor with your API key, and `docker compose logs -f` shows why.
+
+### 3. Connect a client
+
+See [Connect a client](#connect-a-client) below.
+
+### Update
+
+```bash
+docker compose pull && docker compose up -d
+```
+
+Jobs, sessions and workspaces live in the `cursor-worker-data` volume and are kept.
+
+### From the repository instead
+
+The repository's [docker-compose.yml](docker-compose.yml) does the same, can build the image itself, and has an optional Open WebUI already connected (`--profile webui`):
+
+```bash
+git clone https://github.com/domdus/cursor-worker.git && cd cursor-worker
+cp .env.example .env    # set CURSOR_API_KEY and WORKER_TOKEN
+docker compose up -d                   # or: docker compose --profile webui up -d
+```
 
 ## Connect a client
 
