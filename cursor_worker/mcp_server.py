@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 from typing import Any
 
+from mcp import types as mtypes
 from mcp.server.mcpserver import Context, MCPServer
+from mcp.shared.exceptions import NoBackChannelError
+from pydantic import BaseModel, Field
 
 from cursor_worker.jobs import Job, JobError, JobManager, JobRequest
 from cursor_worker.mcp_config import DEPTH_HEADER, parse_depth
@@ -17,10 +22,62 @@ logger = logging.getLogger(__name__)
 INSTRUCTIONS = (
     "Cursor Worker runs coding tasks on a Cursor agent in a workspace folder on the worker's machine. "
     "Use cursor_agent for work that needs files, a shell, a repository or several steps. "
-    "Long tasks return a job_id while still running: poll it with cursor_job, stop it with cursor_cancel."
+    "Long tasks return a job_id while still running: poll it with cursor_job, stop it with cursor_cancel. "
+    "Status needs_approval means a remote command waits for the user: show it to them and let them decide."
 )
 
 _MAX_WAIT = 600
+
+
+class ApprovalAnswer(BaseModel):
+    approve: bool = Field(description="Allow this command on that server?")
+    note: str = Field(default="", description="Optional note for the agent")
+
+
+_STATE = "cursor-worker-approval:"
+_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "approve": {"type": "boolean", "title": "Allow", "description": "Allow this command on that server?"},
+        "note": {"type": "string", "title": "Note", "description": "Optional note for the agent"},
+    },
+    "required": ["approve"],
+}
+
+
+def _approval_message(job: Job, approval: dict[str, Any]) -> str:
+    target = f"{approval['user']}@{approval['host']}" if approval.get("user") else approval["host"]
+    detail = approval.get("command") or "(interactive session or file transfer)"
+    real = approval.get("hostname")
+    return (
+        f"Cursor worker job {job.id} wants to run {approval['tool']} on {target}"
+        + (f" ({real})" if real and real != approval["host"] else "")
+        + f":\n\n{detail}\n\nAllow it?"
+    )
+
+
+def _answer_from(result: Any) -> tuple[bool, str] | None:
+    """(allow, note) from an elicitation answer, or None when the user dismissed it."""
+    action = getattr(result, "action", "")
+    if action not in {"accept", "decline"}:
+        return None
+    if action == "decline":
+        return False, "declined"
+    data = getattr(result, "data", None)
+    content = getattr(result, "content", None)
+    if data is not None:
+        return bool(getattr(data, "approve", False)), str(getattr(data, "note", "") or "")
+    if isinstance(content, dict):
+        return bool(content.get("approve")), str(content.get("note") or "")
+    return False, ""
+
+
+def _can_elicit(ctx: Context | None) -> bool:
+    try:
+        caps = ctx.client_capabilities if ctx is not None else None
+    except Exception:
+        return False
+    return caps is not None and getattr(caps, "elicitation", None) is not None
 
 
 def _depth(ctx: Context | None) -> int:
@@ -33,10 +90,19 @@ def _depth(ctx: Context | None) -> int:
     return parse_depth(headers.get(DEPTH_HEADER) or headers.get(DEPTH_HEADER.lower()))
 
 
-def job_payload(job: Job, *, recent: int = 0) -> dict[str, Any]:
+def job_payload(job: Job, *, recent: int = 0, approval_tool: bool = False) -> dict[str, Any]:
     out: dict[str, Any] = {"job_id": job.id, "status": job.status, "workspace": job.workspace}
     if job.session:
         out["session"] = job.session
+    if job.status == "needs_approval" and job.pending_approval:
+        out["approval"] = job.pending_approval
+        out["hint"] = (
+            "The agent is paused until a human approves this remote command. Show it to the user and ask. "
+            "Do not decide yourself. The user answers with POST /jobs/{id}/approve on the worker"
+            + (" or you pass their answer to cursor_approve" if approval_tool else "")
+            + "; then call cursor_job to wait for the result."
+        ).replace("{id}", job.id)
+        return out
     if job.done:
         if job.result:
             out["result"] = job.result
@@ -74,22 +140,95 @@ def build_mcp(manager: JobManager) -> MCPServer:
         except Exception:
             logger.debug("progress report failed", exc_info=True)
 
-    async def _wait(job: Job, seconds: float, ctx: Context | None) -> Job:
-        """Wait in slices so the client sees progress while the agent works."""
+    def _apply(job: Job, decided: tuple[bool, str]) -> bool:
+        try:
+            manager.decide(job.id, *decided)
+        except JobError:
+            return False
+        return True
+
+    async def _ask_human(job: Job, ctx: Context | None) -> bool | mtypes.InputRequiredResult:
+        """Ask the user through the MCP client (elicitation), never the calling model.
+
+        True once decided. Older protocol versions get a server-initiated request on the open
+        stream; 2026-07-28 clients get an InputRequiredResult and retry the call with the answer.
+        """
+        approval = job.pending_approval
+        if approval is None or not _can_elicit(ctx):
+            return False
+        message = _approval_message(job, approval)
+        try:
+            answer = await asyncio.wait_for(ctx.elicit(message, ApprovalAnswer), settings.ssh_approval_timeout)
+        except NoBackChannelError:
+            return mtypes.InputRequiredResult(
+                input_requests={
+                    f"approve-{approval['id']}": mtypes.ElicitRequest(
+                        params=mtypes.ElicitRequestFormParams(message=message, requested_schema=_SCHEMA)
+                    )
+                },
+                request_state=_STATE + json.dumps({"job": job.id, "approval": approval["id"]}),
+            )
+        except Exception:
+            logger.info("elicitation failed for job %s", job.id, exc_info=True)
+            return False
+        decided = _answer_from(answer)
+        if decided is None or not _apply(job, decided):
+            return False
+        await asyncio.sleep(0)
+        return True
+
+    async def _resume(ctx: Context | None) -> Job | None:
+        """On a retry after InputRequiredResult: apply the user's answer, return the job it belongs to."""
+        try:
+            state = ctx.request_state if ctx is not None else None
+        except Exception:
+            state = None
+        if not state or not state.startswith(_STATE):
+            return None
+        try:
+            ref = json.loads(state[len(_STATE) :])
+        except ValueError:
+            return None
+        job = manager.get(str(ref.get("job") or ""))
+        if job is None:
+            return None
+        response = (ctx.input_responses or {}).get(f"approve-{ref.get('approval')}")
+        pending = job.pending_approval or {}
+        if response is not None and pending.get("id") == ref.get("approval"):
+            decided = _answer_from(response)
+            if decided is not None and _apply(job, decided):
+                await asyncio.sleep(0)
+        return job
+
+    async def _wait(job: Job, seconds: float, ctx: Context | None) -> mtypes.InputRequiredResult | None:
+        """Wait in slices so the client sees progress; stop to ask when the job needs approval."""
         left = max(0.0, min(float(seconds), _MAX_WAIT))
-        while left > 0 and not job.done:
+        while not job.done:
+            if job.status == "needs_approval":
+                asked = await _ask_human(job, ctx)
+                if isinstance(asked, mtypes.InputRequiredResult):
+                    return asked
+                if not asked:
+                    break
+                left = max(left, float(settings.mcp_wait_seconds))
+                continue
+            if left <= 0:
+                break
             step = min(5.0, left)
-            await manager.wait(job, step)
+            await manager.wait(job, step, stop_on_approval=True)
             left -= step
             await _progress(ctx, job)
-        return job
+        return None
+
+    def payload(job: Job, recent: int = 0) -> dict[str, Any]:
+        return job_payload(job, recent=recent, approval_tool=settings.approval_tool)
 
     @server.tool(
         description=(
             "Give a task to a Cursor coding agent. It can read and edit files in the workspace, run a shell, "
-            "use git, and call MCP servers. Returns the agent's final answer plus changed files and commits. "
-            "If the task takes longer than wait_seconds, returns status 'running' and a job_id for cursor_job. "
-            f"tools narrows what the agent may use: one of {', '.join(TOOL_PROFILES)} "
+            "use git, ssh to servers, and call MCP servers. Returns the agent's final answer plus changed files "
+            "and commits. If the task takes longer than wait_seconds, returns status 'running' and a job_id for "
+            f"cursor_job. tools narrows what the agent may use: one of {', '.join(TOOL_PROFILES)} "
             "(full = everything, local = no web search/fetch, offline = no web and no shell, mcp = only MCP tools, "
             "none = chat only). Use the same session for follow-ups that should remember the earlier turns."
         )
@@ -104,24 +243,26 @@ def build_mcp(manager: JobManager) -> MCPServer:
         wait_seconds: int | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
-        try:
-            job = manager.submit(
-                JobRequest(
-                    task=task,
-                    workspace=workspace,
-                    session=session,
-                    model=model,
-                    tools=tools,
-                    mcp_servers=mcp_servers,
-                    depth=_depth(ctx),
-                    origin="mcp",
+        job = await _resume(ctx)
+        if job is None:
+            try:
+                job = manager.submit(
+                    JobRequest(
+                        task=task,
+                        workspace=workspace,
+                        session=session,
+                        model=model,
+                        tools=tools,
+                        mcp_servers=mcp_servers,
+                        depth=_depth(ctx),
+                        origin="mcp",
+                    )
                 )
-            )
-        except JobError as exc:
-            return {"status": "rejected", "error": str(exc)}
+            except JobError as exc:
+                return {"status": "rejected", "error": str(exc)}
         wait = settings.mcp_wait_seconds if wait_seconds is None else wait_seconds
-        await _wait(job, wait, ctx)
-        return job_payload(job, recent=5)
+        asked = await _wait(job, wait, ctx)
+        return asked if asked is not None else payload(job, recent=5)
 
     @server.tool(
         description=(
@@ -130,11 +271,11 @@ def build_mcp(manager: JobManager) -> MCPServer:
         )
     )
     async def cursor_job(job_id: str, wait_seconds: int = 0, ctx: Context | None = None) -> dict[str, Any]:
-        job = manager.get(job_id)
+        job = await _resume(ctx) or manager.get(job_id)
         if job is None:
             return {"status": "unknown", "error": f"No job {job_id!r}."}
-        await _wait(job, wait_seconds, ctx)
-        return job_payload(job, recent=5)
+        asked = await _wait(job, wait_seconds, ctx)
+        return asked if asked is not None else payload(job, recent=5)
 
     @server.tool(description="Stop a running Cursor worker job.")
     async def cursor_cancel(job_id: str) -> dict[str, Any]:
@@ -142,7 +283,27 @@ def build_mcp(manager: JobManager) -> MCPServer:
         if job is None:
             return {"status": "unknown", "error": f"No job {job_id!r}."}
         await manager.wait(job, 15)
-        return job_payload(job)
+        return payload(job)
+
+    if settings.approval_tool:
+
+        @server.tool(
+            description=(
+                "Pass the USER's answer to a job waiting for approval (status needs_approval). Only call this "
+                "after asking the user and getting their explicit answer; never decide on your own."
+            )
+        )
+        async def cursor_approve(
+            job_id: str, approve: bool, note: str = "", wait_seconds: int | None = None, ctx: Context | None = None
+        ) -> dict[str, Any]:
+            try:
+                job = manager.decide(job_id, approve, note)
+            except JobError as exc:
+                return {"status": "rejected", "error": str(exc)}
+            await asyncio.sleep(0)
+            wait = settings.mcp_wait_seconds if wait_seconds is None else wait_seconds
+            asked = await _wait(job, wait, ctx)
+            return asked if asked is not None else payload(job, recent=5)
 
     @server.tool(description="Workspaces the Cursor worker can use, and which one is the default.")
     async def cursor_workspaces() -> dict[str, Any]:

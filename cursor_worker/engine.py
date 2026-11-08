@@ -10,6 +10,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -30,10 +31,13 @@ MISSING_KEY = (
 BASE_INSTRUCTIONS = (
     "You run as a headless worker. Nobody can answer questions while you work: make reasonable "
     "assumptions, finish the task, and ask only if going on would be destructive. End with a short "
-    "summary of what you did, which files you changed, and anything left open."
+    "summary of what you did, which files you changed, and anything left open. "
+    "For remote servers use plain ssh, scp, sftp or rsync. On some hosts a call waits until the user "
+    "approves it; if a call is refused, do not retry it or work around it, say so in your answer."
 )
 
 Emit = Callable[[dict], Awaitable[None]]
+WORKSPACE_ENV = "CURSOR_WORKER_WORKSPACE"
 
 
 class EngineError(RuntimeError):
@@ -108,7 +112,19 @@ class CursorEngine:
                 state = self.settings.state_dir / workspace
                 state.mkdir(parents=True, exist_ok=True)
                 logger.info("starting cursor bridge workspace=%s path=%s", workspace, path)
-                client = await AsyncClient.launch_bridge(workspace=str(path), state_root=str(state), timeout=180)
+                # The bridge copies os.environ, and the agent's shell inherits it from the bridge:
+                # this is how the ssh guard knows which workspace (and so which job) it runs for.
+                previous = os.environ.get(WORKSPACE_ENV)
+                os.environ[WORKSPACE_ENV] = workspace
+                try:
+                    client = await AsyncClient.launch_bridge(
+                        workspace=str(path), state_root=str(state), timeout=180
+                    )
+                finally:
+                    if previous is None:
+                        os.environ.pop(WORKSPACE_ENV, None)
+                    else:
+                        os.environ[WORKSPACE_ENV] = previous
                 self._clients[workspace] = client
             return client
 

@@ -30,6 +30,10 @@ def _int(name: str, default: int, minimum: int = 0) -> int:
         return default
 
 
+def _patterns(raw: str) -> tuple[str, ...]:
+    return tuple(item.strip().lower() for item in raw.replace("\n", ",").split(",") if item.strip())
+
+
 def _profile(raw: str) -> str:
     value = (raw or "").strip().lower()
     return value if value in TOOL_PROFILES else "full"
@@ -57,6 +61,20 @@ class Settings:
     max_call_depth: int = 1
     keep_jobs: int = 200
     instructions: str = ""
+    # Hosts (fnmatch patterns on the ssh alias or its HostName) where a job pauses for a human first.
+    ssh_approval_hosts: tuple[str, ...] = ()
+    ssh_approval_timeout: int = 900
+    # Let MCP callers approve with the cursor_approve tool. Off: the calling model could approve itself.
+    approval_tool: bool = False
+
+    def needs_approval(self, *names: str) -> bool:
+        from fnmatch import fnmatchcase
+
+        for name in names:
+            value = (name or "").strip().lower()
+            if value and any(fnmatchcase(value, pattern) for pattern in self.ssh_approval_hosts):
+                return True
+        return False
 
     def open_without_token(self) -> bool:
         """Only a worker bound to loopback may answer without WORKER_TOKEN."""
@@ -95,6 +113,9 @@ class Settings:
             max_call_depth=_int("MAX_CALL_DEPTH", 1, 1),
             keep_jobs=_int("KEEP_JOBS", 200, 10),
             instructions=os.environ.get("WORKER_INSTRUCTIONS", "").strip(),
+            ssh_approval_hosts=_patterns(os.environ.get("SSH_APPROVAL_HOSTS", "")),
+            ssh_approval_timeout=_int("SSH_APPROVAL_TIMEOUT", 900, 10),
+            approval_tool=_bool("APPROVAL_TOOL", False),
         )
 
 

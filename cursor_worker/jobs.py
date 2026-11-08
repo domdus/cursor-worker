@@ -73,8 +73,12 @@ class Job:
     changes: dict[str, Any] | None = None
     duration_ms: int | None = None
     events: list[dict[str, Any]] = field(default_factory=list)
+    pending_approval: dict[str, Any] | None = None
+    approved_hosts: set[str] = field(default_factory=set)
     changed: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
     task_handle: asyncio.Task | None = field(default=None, repr=False)
+    approval_future: asyncio.Future | None = field(default=None, repr=False)
+    approval_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
     @property
     def done(self) -> bool:
@@ -94,6 +98,7 @@ class Job:
             "created_at": self.created_at,
             "started_at": self.started_at or None,
             "finished_at": self.finished_at or None,
+            "approval": self.pending_approval,
         }
 
     def as_dict(self) -> dict[str, Any]:
@@ -107,6 +112,7 @@ class Job:
             "changes": self.changes,
             "duration_ms": self.duration_ms,
             "events": len(self.events),
+            "approved_hosts": sorted(self.approved_hosts),
         }
 
 
@@ -313,6 +319,9 @@ class JobManager:
             self._finish(job, "cancelled", error="Cancelled before it started.")
 
     def _finish(self, job: Job, status: str, **fields: Any) -> None:
+        if job.approval_future is not None and not job.approval_future.done():
+            job.approval_future.set_result((False, "The job ended."))
+        job.pending_approval = None
         job.status = status
         job.finished_at = _now()
         for key, value in fields.items():
@@ -399,18 +408,22 @@ class JobManager:
             job.task_handle.cancel()
         return job
 
-    async def wait(self, job: Job, timeout: float) -> Job:
-        """Wait until the job ends or the timeout passes, whichever is first."""
-        if job.done or timeout <= 0:
+    async def wait(self, job: Job, timeout: float, *, stop_on_approval: bool = False) -> Job:
+        """Wait until the job ends (or asks for approval) or the timeout passes, whichever is first."""
+
+        def settled() -> bool:
+            return job.done or (stop_on_approval and job.status == "needs_approval")
+
+        if settled() or timeout <= 0:
             return job
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
-        while not job.done:
+        while not settled():
             left = deadline - loop.time()
             if left <= 0:
                 break
             job.changed.clear()
-            if job.done:
+            if settled():
                 break
             try:
                 await asyncio.wait_for(job.changed.wait(), left)
@@ -434,6 +447,100 @@ class JobManager:
                 await asyncio.wait_for(job.changed.wait(), 15)
             except asyncio.TimeoutError:
                 yield {"type": "ping"}
+
+    # ---- remote calls and approvals --------------------------------------------------------
+
+    def active_job(self, workspace: str) -> Job | None:
+        """The job whose agent has a shell in this workspace. File jobs hold the workspace lock, so at most one."""
+        for job in sorted(self.jobs.values(), key=lambda j: j.created_at, reverse=True):
+            if job.workspace == workspace and job.status in {"running", "needs_approval"} and touches_files(job.profile):
+                return job
+        return None
+
+    async def remote_call(
+        self, workspace: str, tool: str, alias: str, hostname: str, user: str, command: str
+    ) -> tuple[bool, str]:
+        """Record an ssh/scp/sftp call in its job; hold it for a human on approval hosts."""
+        alias = (alias or hostname or "?").strip()
+        hostname = (hostname or alias).strip()
+        target = f"{user}@{alias}" if user else alias
+        label = f"{tool} {target}" + (f": {command}" if command and tool == "ssh" else "")
+        label = label if len(label) <= 300 else label[:300] + "…"
+        needs = self.settings.needs_approval(alias, hostname)
+        job = self.active_job(workspace)
+        if job is None:
+            logger.warning("remote call outside a job workspace=%r %s", workspace, label)
+            if needs:
+                return False, f"{alias} needs approval, and no running job was found to ask in."
+            return True, ""
+        await self._emit(job, {"type": "tool", "name": tool, "phase": "start", "text": label,
+                               "host": alias, "hostname": hostname, "command": command})
+        if not needs:
+            return True, ""
+        async with job.approval_lock:
+            if alias.lower() in job.approved_hosts:
+                return True, ""
+            if job.done:
+                return False, "The job ended."
+            approval = {
+                "id": uuid.uuid4().hex[:12],
+                "tool": tool,
+                "host": alias,
+                "hostname": hostname,
+                "user": user,
+                "command": command,
+                "requested_at": _now(),
+            }
+            job.approval_future = asyncio.get_running_loop().create_future()
+            job.pending_approval = approval
+            job.status = "needs_approval"
+            self.store.save(job)
+            await self._emit(job, {"type": "approval", **approval, "text": f"Approval needed: {label}"})
+            logger.info("job %s waits for approval: %s", job.id, label)
+            try:
+                allow, note = await asyncio.wait_for(
+                    asyncio.shield(job.approval_future), self.settings.ssh_approval_timeout
+                )
+            except asyncio.TimeoutError:
+                allow, note = False, f"No answer within {self.settings.ssh_approval_timeout} s."
+            finally:
+                job.approval_future = None
+                job.pending_approval = None
+                if not job.done:
+                    job.status = "running"
+                    self.store.save(job)
+            if allow:
+                job.approved_hosts.add(alias.lower())
+                await self._emit(job, {"type": "status", "text": f"Approved: {alias}" + (f" ({note})" if note else "")})
+                return True, ""
+            await self._emit(job, {"type": "status", "text": f"Denied: {alias}" + (f" ({note})" if note else "")})
+            return False, (
+                f"The user did not approve {tool} to {alias}"
+                + (f": {note}" if note else ".")
+                + " Do not retry or work around this; report it in your answer."
+            )
+
+    def decide(self, job_id: str, allow: bool, note: str = "") -> Job:
+        job = self.jobs.get(job_id)
+        if job is None:
+            raise JobError("Job not found.", status=404)
+        future = job.approval_future
+        if job.status != "needs_approval" or future is None or future.done():
+            raise JobError("This job is not waiting for an approval.", status=409)
+        future.set_result((bool(allow), (note or "").strip()[:300]))
+        # Switch now, not when the waiting call wakes up, so a caller that reads the job next sees it moving.
+        job.pending_approval = None
+        job.status = "running"
+        self.store.save(job)
+        job.changed.set()
+        return job
+
+    def pending_for(self, workspace: str, session: str, origin: str) -> Job | None:
+        for job in sorted(self.jobs.values(), key=lambda j: j.created_at, reverse=True):
+            if job.status == "needs_approval" and job.workspace == workspace and job.origin == origin:
+                if not session or job.session == session:
+                    return job
+        return None
 
     async def aclose(self) -> None:
         running = [j.task_handle for j in self.jobs.values() if j.task_handle is not None and not j.done]

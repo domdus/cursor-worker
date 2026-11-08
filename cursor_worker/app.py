@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 import json
 import logging
@@ -26,6 +27,8 @@ from cursor_worker.workspaces import WorkspaceError, list_workspaces, resolve
 logger = logging.getLogger(__name__)
 
 _OPEN_PATHS = {"/health"}
+# Called by the ssh guard inside the container. No bearer token, but only from loopback.
+_INTERNAL_PATHS = {"/internal/remote"}
 
 
 def _loopback_host(header: str) -> bool:
@@ -43,6 +46,22 @@ def _token_ok(settings: Settings, header: str) -> bool:
         return settings.open_without_token()
     scheme, _, value = str(header or "").partition(" ")
     return scheme.lower() == "bearer" and hmac.compare_digest(value.strip().encode(), settings.token.encode())
+
+
+class RemoteCall(BaseModel):
+    workspace: str = Field(default="", max_length=64)
+    cwd: str = Field(default="", max_length=4096)
+    tool: str = Field(default="ssh", max_length=10)
+    alias: str = Field(default="", max_length=255)
+    hostname: str = Field(default="", max_length=255)
+    user: str = Field(default="", max_length=255)
+    command: str = Field(default="", max_length=4000)
+
+
+class Decision(BaseModel):
+    approve: bool
+    note: str = Field(default="", max_length=300)
+    wait: int = Field(default=0, ge=0, le=600)
 
 
 class JobBody(BaseModel):
@@ -74,13 +93,22 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
     # otherwise refuse every name except 127.0.0.1 when the worker listens on 0.0.0.0.
     mcp_app = mcp.streamable_http_app(
         streamable_http_path="/mcp",
-        stateless_http=True,
+        # Stateful, so the server knows the client's capabilities and can ask the user (elicitation)
+        # when a job needs approval.
+        stateless_http=False,
         transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
     )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         from cursor_worker.git_bootstrap import GitBootstrapError, bootstrap_git
+        from cursor_worker.ssh_setup import prepare_environment, setup_ssh
+
+        prepare_environment(settings)
+        try:
+            app.state.ssh = setup_ssh()
+        except OSError as exc:
+            logger.error("Could not set up ~/.ssh from SSH_* variables: %s", exc)
 
         try:
             _name, path = resolve(settings, "", create=True)
@@ -103,9 +131,15 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
     app = FastAPI(title="Cursor Worker", version=VERSION, lifespan=lifespan)
     app.state.settings = settings
     app.state.jobs = manager
+    app.state.ssh = None
 
     @app.middleware("http")
     async def require_token(request: Request, call_next):
+        if request.url.path in _INTERNAL_PATHS:
+            client = request.client.host if request.client else ""
+            if client not in LOOPBACK_HOSTS:
+                return JSONResponse({"detail": "Only for the ssh guard inside the container."}, status_code=403)
+            return await call_next(request)
         open_mode = not settings.token and settings.open_without_token()
         if open_mode and not _loopback_host(request.headers.get("host", "")):
             return JSONResponse({"detail": "Without WORKER_TOKEN the worker only answers on 127.0.0.1."}, status_code=403)
@@ -123,6 +157,11 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
             "model": settings.model,
             "tool_profile": settings.tool_profile,
             "token_required": bool(settings.token) or not settings.open_without_token(),
+            "ssh": {
+                "configured": bool(app.state.ssh and app.state.ssh.configured),
+                "hosts": list(app.state.ssh.hosts) if app.state.ssh else [],
+                "approval_hosts": list(settings.ssh_approval_hosts),
+            },
         }
 
     @app.get("/workspaces")
@@ -150,7 +189,7 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
         except JobError as exc:
             raise HTTPException(status_code=exc.status, detail=str(exc)) from None
         if body.wait:
-            await manager.wait(job, body.wait)
+            await manager.wait(job, body.wait, stop_on_approval=True)
         return JSONResponse(job.as_dict(), status_code=200 if job.done else 202)
 
     @app.get("/jobs")
@@ -167,7 +206,7 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
     async def get_job(job_id: str, wait: int = 0) -> dict[str, Any]:
         job = _job_or_404(job_id)
         if wait:
-            await manager.wait(job, min(max(wait, 0), 600))
+            await manager.wait(job, min(max(wait, 0), 600), stop_on_approval=True)
         return job.as_dict()
 
     @app.get("/jobs/{job_id}/events")
@@ -189,6 +228,25 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
         return StreamingResponse(
             stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
         )
+
+    @app.post("/jobs/{job_id}/approve")
+    async def approve_job(job_id: str, body: Decision) -> dict[str, Any]:
+        """A human's answer to a job in needs_approval."""
+        try:
+            job = manager.decide(job_id, body.approve, body.note)
+        except JobError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from None
+        await asyncio.sleep(0)
+        if body.wait:
+            await manager.wait(job, body.wait, stop_on_approval=True)
+        return job.as_dict()
+
+    @app.post("/internal/remote")
+    async def remote_call(body: RemoteCall) -> dict[str, Any]:
+        allow, reason = await manager.remote_call(
+            body.workspace, body.tool, body.alias, body.hostname, body.user, body.command
+        )
+        return {"allow": allow, "reason": reason}
 
     @app.post("/jobs/{job_id}/cancel")
     async def cancel_job(job_id: str) -> dict[str, Any]:

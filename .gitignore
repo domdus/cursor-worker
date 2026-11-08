@@ -4,3 +4,6 @@ data/
 __pycache__/
 .pytest_cache/
 *.pyc
+ssh/
+*.key
+id_*

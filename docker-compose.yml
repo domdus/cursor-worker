@@ -29,6 +29,10 @@ services:
       # - ./mcp.json:/data/mcp.json:ro
       # Git key for GIT_REPO over SSH:
       # - ~/.ssh/id_ed25519:/run/secrets/git_ssh:ro
+      # SSH to servers (SSH_KEY / SSH_CONFIG / SSH_KNOWN_HOSTS in .env point here):
+      # - ./ssh/worker_key:/run/secrets/worker_ssh_key:ro
+      # - ./ssh/config:/run/secrets/ssh_config:ro
+      # - ./ssh/known_hosts:/run/secrets/known_hosts:ro
     restart: unless-stopped
 
   # Optional: Open WebUI already wired to the worker. `docker compose --profile webui up -d`

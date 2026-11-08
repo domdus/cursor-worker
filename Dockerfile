@@ -15,7 +15,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PORT=8787
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates git openssh-client curl \
+    && apt-get install -y --no-install-recommends ca-certificates git openssh-client rsync curl \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --uid 1000 worker \
     && mkdir -p /data && chown worker:worker /data

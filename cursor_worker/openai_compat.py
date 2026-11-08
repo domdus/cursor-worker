@@ -6,6 +6,7 @@ only when the agent is new. Agent steps stream as reasoning_content so Open WebU
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from typing import Any
@@ -16,11 +17,33 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from cursor_worker.images import parse_image
 from cursor_worker.jobs import Job, JobError, JobManager, JobRequest
 from cursor_worker.mcp_config import DEPTH_HEADER, parse_depth
+from cursor_worker.workspaces import WorkspaceError, resolve
 
 router = APIRouter(prefix="/v1")
 
 _CONTEXT_CHARS = 60_000
 _SESSION_HEADERS = ("x-openwebui-chat-id", "x-session-id", "x-cursor-session")
+_YES = {"approve", "approved", "yes", "y", "ok", "okay", "allow", "go", "go ahead", "continue", "ja", "jawohl"}
+_NO = {"deny", "denied", "no", "n", "stop", "cancel", "abort", "nein"}
+
+
+def decision_word(text: str) -> bool | None:
+    word = " ".join(str(text or "").strip().lower().strip(".!").split())
+    if word in _YES:
+        return True
+    if word in _NO:
+        return False
+    return None
+
+
+def approval_prompt(job: Job) -> str:
+    item = job.pending_approval or {}
+    target = f"{item.get('user')}@{item.get('host')}" if item.get("user") else str(item.get("host") or "?")
+    command = str(item.get("command") or "").strip() or "(interactive session or file transfer)"
+    return (
+        f"\n\n**Approval needed:** `{item.get('tool', 'ssh')}` on **{target}**\n\n```\n{command}\n```\n\n"
+        "Reply **approve** to run it or **deny** to stop."
+    )
 
 
 def split_model(raw: str) -> tuple[str, str]:
@@ -138,6 +161,18 @@ async def chat_completions(request: Request):
     session = next((request.headers.get(h, "").strip() for h in _SESSION_HEADERS if request.headers.get(h)), "")
     task, context, instructions, images = messages_to_request(body["messages"])
     try:
+        resolved_ws = resolve(manager.settings, workspace, create=False)[0]
+    except WorkspaceError:
+        resolved_ws = workspace
+    paused = manager.pending_for(resolved_ws, session, "openai")
+    if paused is not None:
+        answer = decision_word(task)
+        if answer is None:
+            return _reply(body, paused, approval_prompt(paused).strip(), request)
+        manager.decide(paused.id, answer, "" if answer else "denied in chat")
+        await asyncio.sleep(0)
+        return await _respond(request, manager, body, paused, after=len(paused.events))
+    try:
         job = manager.submit(
             JobRequest(
                 task=task,
@@ -155,11 +190,36 @@ async def chat_completions(request: Request):
         )
     except JobError as exc:
         raise HTTPException(status_code=exc.status, detail=str(exc)) from None
+    return await _respond(request, manager, body, job)
+
+
+def _reply(body: dict, job: Job, text: str, request: Request):
+    """A fixed answer (no new job), in the shape the caller asked for."""
+    cid = f"chatcmpl-{job.id}"
+    shown = str(body.get("model") or job.model)
+    if not body.get("stream"):
+        return JSONResponse({
+            "id": cid, "object": "chat.completion", "created": int(time.time()), "model": shown,
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        })
+
+    async def stream():
+        yield _chunk(cid, shown, {"role": "assistant", "content": text})
+        yield _chunk(cid, shown, {}, "stop")
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
+
+
+async def _respond(request: Request, manager: JobManager, body: dict, job: Job, after: int = 0):
     cid = f"chatcmpl-{job.id}"
     shown = str(body.get("model") or job.model)
 
     if not body.get("stream"):
-        await manager.wait(job, manager.settings.job_timeout + 30)
+        await manager.wait(job, manager.settings.job_timeout + 30, stop_on_approval=True)
+        if job.status == "needs_approval":
+            return _reply(body, job, (job.result or "") + approval_prompt(job), request)
         return JSONResponse(
             {
                 "id": cid,
@@ -181,10 +241,17 @@ async def chat_completions(request: Request):
         finished = False
         try:
             yield _chunk(cid, shown, {"role": "assistant", "content": ""})
-            async for event in manager.follow(job):
+            async for event in manager.follow(job, after):
                 if await request.is_disconnected():
                     break
                 kind = event.get("type")
+                if kind == "approval":
+                    # End this reply with the question; the job waits. The user's next message answers it.
+                    yield _chunk(cid, shown, {"content": approval_prompt(job)})
+                    yield _chunk(cid, shown, {}, "stop")
+                    yield "data: [DONE]\n\n"
+                    finished = True
+                    return
                 if kind == "text":
                     streamed_text = True
                     yield _chunk(cid, shown, {"content": str(event.get("delta") or "")})

@@ -21,6 +21,9 @@ class FakeEngine:
         self.fail: str = ""
         self.running = 0
         self.max_running = 0
+        # Called mid-run, like an agent running ssh: async (spec) -> anything; result kept in hook_results.
+        self.hook = None
+        self.hook_results: list = []
 
     async def run(self, spec: RunSpec, emit) -> Outcome:
         self.specs.append(spec)
@@ -29,6 +32,8 @@ class FakeEngine:
         try:
             await emit({"type": "status", "text": "Thinking..."})
             await emit({"type": "tool", "name": "shell", "phase": "start", "text": "Calling shell..."})
+            if self.hook is not None:
+                self.hook_results.append(await self.hook(spec))
             if self.gate is not None:
                 await self.gate.wait()
             await emit({"type": "tool", "name": "shell", "phase": "end", "text": "Finished shell"})
