@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from cursor_worker.settings import Settings
+from agent_worker.settings import Settings
 
 _NAME = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 

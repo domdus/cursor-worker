@@ -1,4 +1,4 @@
-"""OpenAI-compatible chat endpoint, so Open WebUI (or any OpenAI client) can pick Cursor as a model.
+"""OpenAI-compatible chat endpoint, so Open WebUI (or any OpenAI client) can pick Cursor or Claude Code as a model.
 
 Each request becomes a job. The newest user message is the task; earlier turns are pasted as context
 only when the agent is new. Agent steps stream as reasoning_content so Open WebUI shows them as thinking.
@@ -14,15 +14,15 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from cursor_worker.images import parse_image
-from cursor_worker.jobs import Job, JobError, JobManager, JobRequest
-from cursor_worker.mcp_config import DEPTH_HEADER, parse_depth
-from cursor_worker.workspaces import WorkspaceError, resolve
+from agent_worker.images import parse_image
+from agent_worker.jobs import Job, JobError, JobManager, JobRequest
+from agent_worker.mcp_config import DEPTH_HEADER, parse_depth
+from agent_worker.workspaces import WorkspaceError, resolve
 
 router = APIRouter(prefix="/v1")
 
 _CONTEXT_CHARS = 60_000
-_SESSION_HEADERS = ("x-openwebui-chat-id", "x-session-id", "x-cursor-session")
+_SESSION_HEADERS = ("x-openwebui-chat-id", "x-session-id", "x-agent-session")
 _YES = {"approve", "approved", "yes", "y", "ok", "okay", "allow", "go", "go ahead", "continue", "ja", "jawohl"}
 _NO = {"deny", "denied", "no", "n", "stop", "cancel", "abort", "nein"}
 
@@ -52,9 +52,20 @@ def split_model(raw: str) -> tuple[str, str]:
     if name.startswith("cursor/"):
         name = name[len("cursor/") :]
     model, _, workspace = name.partition("@")
-    if model in {"", "cursor", "cursor-worker"}:
+    if model in {"", "cursor", "agent-worker"}:
         model = ""
     return model, workspace
+
+
+def model_engine(raw: str) -> tuple[str, str, str]:
+    """(engine, model, workspace): 'claude-code/claude-opus-5-5@repo' -> ('claude', 'claude-opus-5-5', 'repo')."""
+    from agent_worker.engines import split_engine
+
+    model, workspace = split_model(raw)
+    engine, model = split_engine(model)
+    if engine and model in {"", "claude", "claude-code"}:
+        model = ""
+    return engine, model, workspace
 
 
 def _text_and_images(content: Any) -> tuple[str, list[dict[str, str]]]:
@@ -131,7 +142,7 @@ def _answer(job: Job) -> str:
     if job.status == "cancelled":
         return job.result or "(cancelled)"
     detail = job.error or "The agent failed."
-    return f"{job.result}\n\n**Cursor worker error:** {detail}".strip()
+    return f"{job.result}\n\n**Agent worker error:** {detail}".strip()
 
 
 @router.get("/models")
@@ -139,11 +150,14 @@ async def models(request: Request) -> dict[str, Any]:
     manager: JobManager = request.app.state.jobs
     rows = await manager.engine.models()
     default = manager.settings.model
-    if default and not any(row["id"] == default for row in rows):
-        rows = [{"id": default, "name": default}, *rows]
+    if default and manager.settings.cursor_api_key and not any(row["id"] == default for row in rows):
+        rows = [{"id": default, "name": default, "engine": "cursor"}, *rows]
     return {
         "object": "list",
-        "data": [{"id": row["id"], "object": "model", "created": 0, "owned_by": "cursor"} for row in rows],
+        "data": [
+            {"id": row["id"], "object": "model", "created": 0, "owned_by": row.get("engine") or "cursor"}
+            for row in rows
+        ],
     }
 
 
@@ -156,8 +170,8 @@ async def chat_completions(request: Request):
         raise HTTPException(status_code=400, detail="Body is not JSON.") from None
     if not isinstance(body, dict) or not isinstance(body.get("messages"), list):
         raise HTTPException(status_code=400, detail="messages is required.")
-    model, workspace = split_model(str(body.get("model") or ""))
-    workspace = request.headers.get("x-cursor-workspace", "").strip() or workspace
+    engine, model, workspace = model_engine(str(body.get("model") or ""))
+    workspace = request.headers.get("x-agent-workspace", "").strip() or workspace
     session = next((request.headers.get(h, "").strip() for h in _SESSION_HEADERS if request.headers.get(h)), "")
     task, context, instructions, images = messages_to_request(body["messages"])
     try:
@@ -180,12 +194,13 @@ async def chat_completions(request: Request):
                 session=session,
                 model=model,
                 effort=str(body.get("reasoning_effort") or ""),
-                tools=request.headers.get("x-cursor-tools", "").strip(),
+                tools=request.headers.get("x-agent-tools", "").strip(),
                 images=images,
                 context=context,
                 instructions=instructions,
                 depth=parse_depth(request.headers.get(DEPTH_HEADER)),
                 origin="openai",
+                engine=engine,
             )
         )
     except JobError as exc:
@@ -230,7 +245,7 @@ async def _respond(request: Request, manager: JobManager, body: dict, job: Job, 
                     {"index": 0, "message": {"role": "assistant", "content": _answer(job)}, "finish_reason": "stop"}
                 ],
                 "usage": _usage(job),
-                "cursor_worker": {"job_id": job.id, "status": job.status, "changes": job.changes},
+                "agent_worker": {"job_id": job.id, "status": job.status, "changes": job.changes},
             }
         )
 

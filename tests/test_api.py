@@ -6,8 +6,8 @@ from dataclasses import replace
 import pytest
 from fastapi.testclient import TestClient
 
-from cursor_worker.app import create_app
-from cursor_worker.openai_compat import messages_to_request, split_model
+from agent_worker.app import create_app
+from agent_worker.openai_compat import messages_to_request, split_model
 
 
 @pytest.fixture
@@ -70,7 +70,7 @@ def test_job_events_sse(client):
 def test_bad_requests(client):
     assert client.post("/jobs", json={"task": "x", "workspace": "../etc"}).status_code == 400
     assert client.post("/jobs", json={"task": " "}).status_code == 400
-    assert client.post("/jobs", json={"task": "x"}, headers={"X-Cursor-Worker-Depth": "1"}).status_code == 409
+    assert client.post("/jobs", json={"task": "x"}, headers={"X-Agent-Worker-Depth": "1"}).status_code == 409
     assert client.get("/jobs/nope").status_code == 404
 
 

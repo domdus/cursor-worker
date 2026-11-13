@@ -4,7 +4,7 @@ from dataclasses import replace
 
 import pytest
 
-from cursor_worker.mcp_config import (
+from agent_worker.mcp_config import (
     DEPTH_HEADER,
     McpConfigError,
     load_mcp_servers,
@@ -12,8 +12,8 @@ from cursor_worker.mcp_config import (
     servers_from_request,
     with_depth,
 )
-from cursor_worker.settings import narrow_profile, profile_tools, touches_files
-from cursor_worker.workspaces import WorkspaceError, list_workspaces, resolve
+from agent_worker.settings import narrow_profile, profile_tools, touches_files
+from agent_worker.workspaces import WorkspaceError, list_workspaces, resolve
 
 
 def test_request_can_only_narrow_the_tool_profile():

@@ -6,8 +6,8 @@ from dataclasses import replace
 
 import pytest
 
-from cursor_worker.engine import RunSpec, compose_message, git_changes, git_head
-from cursor_worker.jobs import JobError, JobManager, JobRequest, Store
+from agent_worker.engine import RunSpec, compose_message, git_changes, git_head
+from agent_worker.jobs import JobError, JobManager, JobRequest, Store
 
 
 def manager_for(settings, engine):
@@ -34,7 +34,7 @@ async def test_spec_gets_depth_and_narrowed_tools(settings, engine):
     await manager.wait(job, 5)
     spec = engine.specs[0]
     assert spec.profile == "local"
-    assert spec.mcp_servers["gh"]["headers"]["X-Cursor-Worker-Depth"] == "1"
+    assert spec.mcp_servers["gh"]["headers"]["X-Agent-Worker-Depth"] == "1"
 
 
 async def test_nested_call_is_refused(settings, engine):

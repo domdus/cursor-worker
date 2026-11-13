@@ -16,10 +16,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol
 
-from cursor_worker.events import map_sdk_message
-from cursor_worker.images import cursor_payload
-from cursor_worker.redact import redact
-from cursor_worker.settings import Settings, profile_tools
+from agent_worker.events import map_sdk_message
+from agent_worker.images import cursor_payload
+from agent_worker.redact import redact
+from agent_worker.settings import Settings, profile_tools
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +37,7 @@ BASE_INSTRUCTIONS = (
 )
 
 Emit = Callable[[dict], Awaitable[None]]
-WORKSPACE_ENV = "CURSOR_WORKER_WORKSPACE"
+WORKSPACE_ENV = "AGENT_WORKER_WORKSPACE"
 
 
 class EngineError(RuntimeError):
@@ -60,6 +60,8 @@ class RunSpec:
     context: str = ""
     # Caller's standing instructions (an OpenAI system message), also only on a new agent.
     instructions: str = ""
+    # Which engine runs it: cursor (Cursor SDK) or claude (Claude Code).
+    engine: str = "cursor"
 
 
 @dataclass

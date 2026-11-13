@@ -1,7 +1,7 @@
 [project]
-name = "cursor-worker"
-version = "0.2.0"
-description = "Headless Cursor SDK agent as a Docker service: MCP tool, job API and OpenAI-compatible chat."
+name = "agent-worker"
+version = "0.3.0"
+description = "Headless coding agent (Cursor SDK or Claude Code) as a Docker service: MCP tool, job API and OpenAI-compatible chat."
 license = "MIT"
 requires-python = ">=3.12"
 

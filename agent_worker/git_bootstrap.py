@@ -75,7 +75,7 @@ def _configure_credentials(git: str, workspace: Path, repo: str) -> None:
         _run([git, "-C", str(workspace), "config", "--replace-all", f"credential.{origin}.helper", _TOKEN_HELPER], env=env)
     key = _prepare_ssh_key()
     if key is not None:
-        known = Path(tempfile.gettempdir()) / "cursor-worker-known-hosts"
+        known = Path(tempfile.gettempdir()) / "agent-worker-known-hosts"
         command = f"ssh -i {key} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile={known}"
         _run([git, "-C", str(workspace), "config", "core.sshCommand", command], env=env)
 
@@ -107,7 +107,7 @@ def _git_env(repo: str = "") -> dict[str, str]:
         env["GIT_CONFIG_KEY_0"], env["GIT_CONFIG_VALUE_0"] = header
     key = _prepare_ssh_key()
     if key is not None:
-        known = Path(tempfile.gettempdir()) / "cursor-worker-known-hosts"
+        known = Path(tempfile.gettempdir()) / "agent-worker-known-hosts"
         env["GIT_SSH_COMMAND"] = (
             f"ssh -i {key} -o IdentitiesOnly=yes "
             f"-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile={known}"
@@ -119,7 +119,7 @@ def _prepare_ssh_key() -> Path | None:
     raw = os.environ.get("GIT_SSH_KEY", "").strip()
     if not raw:
         return None
-    dest = Path(tempfile.mkdtemp(prefix="cursor-worker-ssh-")) / "id"
+    dest = Path(tempfile.mkdtemp(prefix="agent-worker-ssh-")) / "id"
     if raw.startswith("-----BEGIN"):
         text = raw if raw.endswith("\n") else raw + "\n"
         dest.write_text(text, encoding="utf-8")

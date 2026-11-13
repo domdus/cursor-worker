@@ -1,4 +1,4 @@
-"""MCP front door: any MCP client (Hermes, Claude Code, Open WebUI, AI Workspace) can hand a task to Cursor."""
+"""MCP front door: any MCP client (Hermes, Claude Code, Open WebUI, AI Workspace) can hand a task to a coding agent."""
 
 from __future__ import annotations
 
@@ -12,17 +12,17 @@ from mcp.server.mcpserver import Context, MCPServer
 from mcp.shared.exceptions import NoBackChannelError
 from pydantic import BaseModel, Field
 
-from cursor_worker.jobs import Job, JobError, JobManager, JobRequest
-from cursor_worker.mcp_config import DEPTH_HEADER, parse_depth
-from cursor_worker.settings import TOOL_PROFILES
-from cursor_worker.workspaces import list_workspaces
+from agent_worker.jobs import Job, JobError, JobManager, JobRequest
+from agent_worker.mcp_config import DEPTH_HEADER, parse_depth
+from agent_worker.settings import TOOL_PROFILES
+from agent_worker.workspaces import list_workspaces
 
 logger = logging.getLogger(__name__)
 
 INSTRUCTIONS = (
-    "Cursor Worker runs coding tasks on a Cursor agent in a workspace folder on the worker's machine. "
-    "Use cursor_agent for work that needs files, a shell, a repository or several steps. "
-    "Long tasks return a job_id while still running: poll it with cursor_job, stop it with cursor_cancel. "
+    "Agent Worker runs coding tasks on a coding agent (Cursor or Claude Code) in a workspace folder on the "
+    "worker's machine. Use agent_run for work that needs files, a shell, a repository or several steps. "
+    "Long tasks return a job_id while still running: poll it with agent_job, stop it with agent_cancel. "
     "Status needs_approval means a remote command waits for the user: show it to them and let them decide."
 )
 
@@ -34,7 +34,7 @@ class ApprovalAnswer(BaseModel):
     note: str = Field(default="", description="Optional note for the agent")
 
 
-_STATE = "cursor-worker-approval:"
+_STATE = "agent-worker-approval:"
 _SCHEMA = {
     "type": "object",
     "properties": {
@@ -50,7 +50,7 @@ def _approval_message(job: Job, approval: dict[str, Any]) -> str:
     detail = approval.get("command") or "(interactive session or file transfer)"
     real = approval.get("hostname")
     return (
-        f"Cursor worker job {job.id} wants to run {approval['tool']} on {target}"
+        f"Agent job {job.id} wants to run {approval['tool']} on {target}"
         + (f" ({real})" if real and real != approval["host"] else "")
         + f":\n\n{detail}\n\nAllow it?"
     )
@@ -91,7 +91,7 @@ def _depth(ctx: Context | None) -> int:
 
 
 def job_payload(job: Job, *, recent: int = 0, approval_tool: bool = False) -> dict[str, Any]:
-    out: dict[str, Any] = {"job_id": job.id, "status": job.status, "workspace": job.workspace}
+    out: dict[str, Any] = {"job_id": job.id, "status": job.status, "engine": job.engine, "workspace": job.workspace}
     if job.session:
         out["session"] = job.session
     if job.status == "needs_approval" and job.pending_approval:
@@ -99,8 +99,8 @@ def job_payload(job: Job, *, recent: int = 0, approval_tool: bool = False) -> di
         out["hint"] = (
             "The agent is paused until a human approves this remote command. Show it to the user and ask. "
             "Do not decide yourself. The user answers with POST /jobs/{id}/approve on the worker"
-            + (" or you pass their answer to cursor_approve" if approval_tool else "")
-            + "; then call cursor_job to wait for the result."
+            + (" or you pass their answer to agent_approve" if approval_tool else "")
+            + "; then call agent_job to wait for the result."
         ).replace("{id}", job.id)
         return out
     if job.done:
@@ -113,7 +113,7 @@ def job_payload(job: Job, *, recent: int = 0, approval_tool: bool = False) -> di
         if job.usage:
             out["usage"] = job.usage
     else:
-        out["hint"] = "Still running. Call cursor_job with this job_id to wait for the result."
+        out["hint"] = "Still running. Call agent_job with this job_id to wait for the result."
         if recent:
             steps = [
                 str(e.get("text") or e.get("message") or "")
@@ -124,9 +124,21 @@ def job_payload(job: Job, *, recent: int = 0, approval_tool: bool = False) -> di
     return out
 
 
+_ENGINE_LABELS = {"cursor": "cursor (Cursor SDK)", "claude": "claude (Claude Code)"}
+
+
+def _engines_note(engine) -> str:
+    """Which engines this worker has, for the agent_run description. Set up at start; signing in later works too."""
+    engines = getattr(engine, "engines", None) or {"cursor": engine}
+    default = engine.default() if hasattr(engine, "default") else "cursor"
+    names = [_ENGINE_LABELS.get(name, name) + (" (default)" if name == default else "") for name in engines]
+    return "engine picks the agent: " + ", ".join(names) + ". Leave it empty for the default."
+
+
 def build_mcp(manager: JobManager) -> MCPServer:
     settings = manager.settings
-    server = MCPServer(name="cursor-worker", instructions=INSTRUCTIONS)
+    server = MCPServer(name="agent-worker", instructions=INSTRUCTIONS)
+    engines_note = _engines_note(manager.engine)
 
     async def _progress(ctx: Context | None, job: Job) -> None:
         if ctx is None:
@@ -225,15 +237,16 @@ def build_mcp(manager: JobManager) -> MCPServer:
 
     @server.tool(
         description=(
-            "Give a task to a Cursor coding agent. It can read and edit files in the workspace, run a shell, "
+            "Give a task to a coding agent. It can read and edit files in the workspace, run a shell, "
             "use git, ssh to servers, and call MCP servers. Returns the agent's final answer plus changed files "
             "and commits. If the task takes longer than wait_seconds, returns status 'running' and a job_id for "
-            f"cursor_job. tools narrows what the agent may use: one of {', '.join(TOOL_PROFILES)} "
+            f"agent_job. tools narrows what the agent may use: one of {', '.join(TOOL_PROFILES)} "
             "(full = everything, local = no web search/fetch, offline = no web and no shell, mcp = only MCP tools, "
-            "none = chat only). Use the same session for follow-ups that should remember the earlier turns."
+            "none = chat only). Use the same session for follow-ups that should remember the earlier turns. "
+            + engines_note
         )
     )
-    async def cursor_agent(
+    async def agent_run(
         task: str,
         workspace: str = "",
         session: str = "",
@@ -241,6 +254,7 @@ def build_mcp(manager: JobManager) -> MCPServer:
         tools: str = "",
         mcp_servers: dict[str, Any] | None = None,
         wait_seconds: int | None = None,
+        engine: str = "",
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         job = await _resume(ctx)
@@ -256,6 +270,7 @@ def build_mcp(manager: JobManager) -> MCPServer:
                         mcp_servers=mcp_servers,
                         depth=_depth(ctx),
                         origin="mcp",
+                        engine=engine,
                     )
                 )
             except JobError as exc:
@@ -266,19 +281,19 @@ def build_mcp(manager: JobManager) -> MCPServer:
 
     @server.tool(
         description=(
-            "Status and result of a Cursor worker job. wait_seconds waits for the job to finish "
+            "Status and result of an agent job. wait_seconds waits for the job to finish "
             "(up to 600) before answering."
         )
     )
-    async def cursor_job(job_id: str, wait_seconds: int = 0, ctx: Context | None = None) -> dict[str, Any]:
+    async def agent_job(job_id: str, wait_seconds: int = 0, ctx: Context | None = None) -> dict[str, Any]:
         job = await _resume(ctx) or manager.get(job_id)
         if job is None:
             return {"status": "unknown", "error": f"No job {job_id!r}."}
         asked = await _wait(job, wait_seconds, ctx)
         return asked if asked is not None else payload(job, recent=5)
 
-    @server.tool(description="Stop a running Cursor worker job.")
-    async def cursor_cancel(job_id: str) -> dict[str, Any]:
+    @server.tool(description="Stop a running agent job.")
+    async def agent_cancel(job_id: str) -> dict[str, Any]:
         job = manager.cancel(job_id)
         if job is None:
             return {"status": "unknown", "error": f"No job {job_id!r}."}
@@ -293,7 +308,7 @@ def build_mcp(manager: JobManager) -> MCPServer:
                 "after asking the user and getting their explicit answer; never decide on your own."
             )
         )
-        async def cursor_approve(
+        async def agent_approve(
             job_id: str, approve: bool, note: str = "", wait_seconds: int | None = None, ctx: Context | None = None
         ) -> dict[str, Any]:
             try:
@@ -305,8 +320,8 @@ def build_mcp(manager: JobManager) -> MCPServer:
             asked = await _wait(job, wait, ctx)
             return asked if asked is not None else payload(job, recent=5)
 
-    @server.tool(description="Workspaces the Cursor worker can use, and which one is the default.")
-    async def cursor_workspaces() -> dict[str, Any]:
+    @server.tool(description="Workspaces the agents can use, and which one is the default.")
+    async def agent_workspaces() -> dict[str, Any]:
         return {"workspaces": list_workspaces(settings), "create_on_demand": settings.create_workspaces}
 
     return server

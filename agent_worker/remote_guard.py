@@ -24,7 +24,7 @@ _SSH_VALUE_OPTS = set("BbcDEeFIiJLlmOoPpQRSWw")
 # scp/sftp options that take a value.
 _SCP_VALUE_OPTS = set("cDFiJloPSX")
 _PASS_THROUGH = {"-V", "-G", "-Q", "-h", "--help"}
-DONE_ENV = "CURSOR_WORKER_GUARD_DONE"
+DONE_ENV = "AGENT_WORKER_GUARD_DONE"
 
 
 def real_program(name: str, own_dir: str) -> str:
@@ -124,9 +124,9 @@ def resolve(real_ssh: str, opts: list[str], destination: str) -> tuple[str, str,
 
 
 def ask_worker(payload: dict) -> tuple[bool, str]:
-    url = os.environ.get("CURSOR_WORKER_URL", "").rstrip("/") + "/internal/remote"
+    url = os.environ.get("AGENT_WORKER_URL", "").rstrip("/") + "/internal/remote"
     try:
-        timeout = float(os.environ.get("CURSOR_WORKER_APPROVAL_TIMEOUT", "900")) + 30
+        timeout = float(os.environ.get("AGENT_WORKER_APPROVAL_TIMEOUT", "900")) + 30
     except ValueError:
         timeout = 930.0
     request = urllib.request.Request(
@@ -139,13 +139,13 @@ def ask_worker(payload: dict) -> tuple[bool, str]:
         with urllib.request.urlopen(request, timeout=timeout) as resp:
             body = json.loads(resp.read().decode() or "{}")
     except (urllib.error.URLError, OSError, ValueError) as exc:
-        return False, f"could not reach the Cursor worker to record this call ({exc}); refusing to run it"
+        return False, f"could not reach the agent worker to record this call ({exc}); refusing to run it"
     return bool(body.get("allow")), str(body.get("reason") or "")
 
 
 def _payload(tool: str, alias: str, hostname: str, user: str, command: str) -> dict:
     return {
-        "workspace": os.environ.get("CURSOR_WORKER_WORKSPACE", ""),
+        "workspace": os.environ.get("AGENT_WORKER_WORKSPACE", ""),
         "cwd": os.getcwd(),
         "tool": tool,
         "alias": alias,
@@ -159,7 +159,7 @@ def main(argv: list[str]) -> int:
     tool, args = argv[1], argv[2:]
     own_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bin")
     real = real_program(tool, own_dir)
-    guarded = bool(os.environ.get("CURSOR_WORKER_URL")) and not os.environ.get(DONE_ENV)
+    guarded = bool(os.environ.get("AGENT_WORKER_URL")) and not os.environ.get(DONE_ENV)
     if not guarded:
         os.execv(real, [real, *args])
     real_ssh = real if tool == "ssh" else real_program("ssh", own_dir)
@@ -178,7 +178,7 @@ def main(argv: list[str]) -> int:
     for alias, hostname, user, command in calls:
         allow, reason = ask_worker(_payload(tool, alias, hostname, user, command))
         if not allow:
-            sys.stderr.write(f"cursor-worker: {reason or 'this call was refused'}\n")
+            sys.stderr.write(f"agent-worker: {reason or 'this call was refused'}\n")
             return 255
     if tool in {"scp", "sftp"}:
         # Their inner ssh call was covered above; point them at the guard so PATH stays honest.

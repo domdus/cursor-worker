@@ -1,4 +1,4 @@
-# Cursor Worker: a headless Cursor agent for anything that speaks MCP or the OpenAI API.
+# Agent Worker: a headless Cursor agent for anything that speaks MCP or the OpenAI API.
 #
 #   cp .env.example .env      # paste CURSOR_API_KEY, generate WORKER_TOKEN
 #   docker compose up -d
@@ -8,13 +8,13 @@
 # Jobs:     http://<host>:8787/jobs           (start, poll, stream, cancel)
 # Every endpoint except /health needs:  Authorization: Bearer $WORKER_TOKEN
 
-name: cursor-worker
+name: agent-worker
 
 services:
-  cursor-worker:
-    image: ghcr.io/domdus/cursor-worker:latest
+  agent-worker:
+    image: ghcr.io/domdus/agent-worker:latest
     build: .
-    container_name: cursor-worker
+    container_name: agent-worker
     env_file: .env
     ports:
       # Only this machine. Use "8787:8787" to open it to your LAN (WORKER_TOKEN is then required).
@@ -22,7 +22,7 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
-      - cursor-worker-data:/data
+      - agent-worker-data:/data
       # A host project as the default workspace (owned by uid 1000, or set user: below):
       # - /path/to/project:/workspace
       # MCP servers every job gets (stdio allowed here, not from requests):
@@ -43,16 +43,16 @@ services:
     ports:
       - "127.0.0.1:3000:8080"
     environment:
-      OPENAI_API_BASE_URL: http://cursor-worker:8787/v1
+      OPENAI_API_BASE_URL: http://agent-worker:8787/v1
       OPENAI_API_KEY: ${WORKER_TOKEN}
       # Sends X-OpenWebUI-Chat-Id so one chat keeps one Cursor agent.
       ENABLE_FORWARD_USER_INFO_HEADERS: "true"
     volumes:
       - open-webui-data:/app/backend/data
     depends_on:
-      - cursor-worker
+      - agent-worker
     restart: unless-stopped
 
 volumes:
-  cursor-worker-data:
+  agent-worker-data:
   open-webui-data:

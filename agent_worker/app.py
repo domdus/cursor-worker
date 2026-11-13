@@ -14,15 +14,15 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import BaseModel, Field
 
-from cursor_worker import openai_compat
-from cursor_worker.engine import CursorEngine, Engine
-from cursor_worker.images import parse_images
-from cursor_worker.jobs import JobError, JobManager, JobRequest, Store
-from cursor_worker.mcp_config import DEPTH_HEADER, parse_depth
-from cursor_worker.mcp_server import build_mcp
-from cursor_worker.settings import LOOPBACK_HOSTS, Settings
-from cursor_worker.version import VERSION
-from cursor_worker.workspaces import WorkspaceError, list_workspaces, resolve
+from agent_worker import openai_compat
+from agent_worker.engine import CursorEngine, Engine
+from agent_worker.images import parse_images
+from agent_worker.jobs import JobError, JobManager, JobRequest, Store
+from agent_worker.mcp_config import DEPTH_HEADER, parse_depth
+from agent_worker.mcp_server import build_mcp
+from agent_worker.settings import LOOPBACK_HOSTS, Settings
+from agent_worker.version import VERSION
+from agent_worker.workspaces import WorkspaceError, list_workspaces, resolve
 
 logger = logging.getLogger(__name__)
 
@@ -64,8 +64,13 @@ class Decision(BaseModel):
     wait: int = Field(default=0, ge=0, le=600)
 
 
+class LoginCode(BaseModel):
+    code: str = Field(default="", max_length=512)
+
+
 class JobBody(BaseModel):
     task: str = Field(max_length=320_000)
+    engine: str = Field(default="", max_length=20)
     workspace: str = Field(default="", max_length=64)
     session: str = Field(default="", max_length=200)
     model: str = Field(default="", max_length=200)
@@ -86,7 +91,15 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
     settings = settings or Settings.from_env()
     settings.ensure_dirs()
     store = Store(settings.data_dir / "worker.sqlite")
-    engine = engine or CursorEngine(settings, (store.agent_id, store.set_agent_id))
+    if engine is None:
+        from agent_worker.claude_engine import ClaudeEngine
+        from agent_worker.engines import EngineRouter
+
+        ids = (store.agent_id, store.set_agent_id)
+        engine = EngineRouter(
+            {"cursor": CursorEngine(settings, ids), "claude": ClaudeEngine(settings, ids)},
+            settings.default_engine,
+        )
     manager = JobManager(settings, engine, store)
     mcp = build_mcp(manager)
     # Our own middleware checks the token and the Host header; the MCP app's host check would
@@ -101,8 +114,8 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        from cursor_worker.git_bootstrap import GitBootstrapError, bootstrap_git
-        from cursor_worker.ssh_setup import prepare_environment, setup_ssh
+        from agent_worker.git_bootstrap import GitBootstrapError, bootstrap_git
+        from agent_worker.ssh_setup import prepare_environment, setup_ssh
 
         prepare_environment(settings)
         try:
@@ -116,8 +129,10 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
         except (GitBootstrapError, WorkspaceError) as exc:
             # A wrong token or an unreachable repo must not take the worker down with it.
             logger.error("Could not set up GIT_REPO in the default workspace: %s", exc)
-        if not settings.cursor_api_key:
-            logger.warning("CURSOR_API_KEY is not set. Jobs will fail until it is.")
+        if not engine.available:
+            logger.warning(
+                "Neither CURSOR_API_KEY nor a Claude credential is set. Jobs will fail until one is."
+            )
         if not settings.token and not settings.open_without_token():
             logger.warning("No WORKER_TOKEN and HOST=%s: every request is refused until a token is set.", settings.host)
         async with mcp.session_manager.run():
@@ -125,10 +140,13 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
                 yield
             finally:
                 await manager.aclose()
+                login = getattr(app.state, "claude_login", None)
+                if login is not None:
+                    login.close()
                 await engine.aclose()
                 store.close()
 
-    app = FastAPI(title="Cursor Worker", version=VERSION, lifespan=lifespan)
+    app = FastAPI(title="Agent Worker", version=VERSION, lifespan=lifespan)
     app.state.settings = settings
     app.state.jobs = manager
     app.state.ssh = None
@@ -148,12 +166,35 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
             return JSONResponse({"detail": detail}, status_code=401, headers={"WWW-Authenticate": "Bearer"})
         return await call_next(request)
 
+    def _engine_ready(name: str) -> bool:
+        engines = getattr(engine, "engines", None)
+        if engines is None:
+            return engine.available if name == "cursor" else False
+        return name in engines and engines[name].available
+
+    def _login_manager():
+        from agent_worker.claude_login import LoginManager
+
+        if getattr(app.state, "claude_login", None) is None:
+            app.state.claude_login = LoginManager()
+        return app.state.claude_login
+
     @app.get("/health")
     async def health() -> dict[str, Any]:
+        from agent_worker.claude_engine import credential_source, sdk_installed
+
+        default = engine.default() if hasattr(engine, "default") else "cursor"
         return {
             "ok": True,
             "version": VERSION,
-            "cursor": engine.available,
+            "cursor": _engine_ready("cursor"),
+            "claude": {
+                "ready": _engine_ready("claude"),
+                "installed": sdk_installed(),
+                "credential": credential_source(settings),
+                "model": settings.claude_model,
+            },
+            "default_engine": default,
             "model": settings.model,
             "tool_profile": settings.tool_profile,
             "token_required": bool(settings.token) or not settings.open_without_token(),
@@ -163,6 +204,54 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
                 "approval_hosts": list(settings.ssh_approval_hosts),
             },
         }
+
+    @app.post("/auth/claude/login")
+    async def claude_login_start() -> dict[str, Any]:
+        """Start Anthropic's `claude setup-token`; returns the sign-in link to open."""
+        from agent_worker.claude_login import LoginError
+
+        try:
+            login = await _login_manager().start()
+        except LoginError as exc:
+            raise HTTPException(status_code=501 if exc.key == "cli_missing" else 502, detail=exc.key) from None
+        return {
+            "id": login.id,
+            "url": login.link,
+            "next": f"Open the url, sign in, then POST the code Anthropic shows to /auth/claude/login/{login.id}.",
+        }
+
+    @app.post("/auth/claude/login/{login_id}")
+    async def claude_login_finish(login_id: str, body: LoginCode) -> dict[str, Any]:
+        """Hand over the code; the Claude Plan token is saved in the data volume (never returned or logged)."""
+        from agent_worker.claude_engine import credential_source
+        from agent_worker.claude_login import LoginError, save_token
+
+        try:
+            token = await _login_manager().finish(login_id, body.code)
+        except LoginError as exc:
+            status = {"expired": 410, "bad_code": 400, "code_rejected": 400}.get(exc.key, 502)
+            raise HTTPException(status_code=status, detail=exc.key) from None
+        save_token(settings.claude_token_path, token)
+        logger.info("Claude sign-in finished; Plan token saved")
+        source = credential_source(settings)
+        return {
+            "ok": True,
+            "credential": source,
+            "note": "Saved. Claude jobs use it now."
+            if source == "signed-in"
+            else "Saved, but CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY on the container wins over it.",
+        }
+
+    @app.delete("/auth/claude/login/{login_id}", status_code=204)
+    async def claude_login_cancel(login_id: str) -> None:
+        _login_manager().cancel(login_id)
+
+    @app.delete("/auth/claude/token")
+    async def claude_sign_out() -> dict[str, Any]:
+        """Forget the signed-in Plan token (environment variables are not touched)."""
+        from agent_worker.claude_login import forget_token
+
+        return {"removed": forget_token(settings.claude_token_path)}
 
     @app.get("/workspaces")
     async def workspaces() -> dict[str, Any]:
@@ -174,6 +263,7 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
             job = manager.submit(
                 JobRequest(
                     task=body.task,
+                    engine=body.engine,
                     workspace=body.workspace,
                     session=body.session,
                     model=body.model,

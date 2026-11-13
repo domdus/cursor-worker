@@ -14,7 +14,7 @@ _LOOPBACK = {"127.0.0.1", "localhost", "::1"}
 
 # Sent to every HTTP MCP server the agent uses. When the agent calls this worker (or another
 # worker) back through MCP, the receiver sees the depth and refuses to start a nested job.
-DEPTH_HEADER = "X-Cursor-Worker-Depth"
+DEPTH_HEADER = "X-Agent-Worker-Depth"
 
 
 class McpConfigError(ValueError):

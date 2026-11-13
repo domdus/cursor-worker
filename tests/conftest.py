@@ -6,8 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from cursor_worker.engine import EngineError, Outcome, RunSpec
-from cursor_worker.settings import Settings
+from agent_worker.engine import EngineError, Outcome, RunSpec
+from agent_worker.settings import Settings
 
 
 class FakeEngine:

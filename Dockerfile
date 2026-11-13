@@ -3,8 +3,8 @@ FROM python:3.12-slim-bookworm
 ARG VERSION=dev
 
 LABEL \
-  org.opencontainers.image.source="https://github.com/domdus/cursor-worker" \
-  org.opencontainers.image.description="Headless Cursor SDK agent: MCP tool, job API and OpenAI-compatible chat" \
+  org.opencontainers.image.source="https://github.com/domdus/agent-worker" \
+  org.opencontainers.image.description="Headless coding agent (Cursor SDK or Claude Code): MCP tool, job API and OpenAI-compatible chat" \
   org.opencontainers.image.licenses="MIT" \
   org.opencontainers.image.version="${VERSION}"
 
@@ -23,11 +23,11 @@ RUN apt-get update \
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY cursor_worker ./cursor_worker
+COPY agent_worker ./agent_worker
 
 USER worker
 VOLUME ["/data"]
 EXPOSE 8787
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s \
   CMD curl -fsS "http://127.0.0.1:${PORT}/health" -H "Host: 127.0.0.1" >/dev/null || exit 1
-CMD ["python", "-m", "cursor_worker.app"]
+CMD ["python", "-m", "agent_worker.app"]

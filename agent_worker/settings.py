@@ -11,6 +11,9 @@ LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 # Tool profiles, most permissive first. A request can only pick the same or a narrower one
 # than TOOL_PROFILE on the container.
 TOOL_PROFILES = ("full", "local", "offline", "mcp", "none")
+# Agent engines a job can run on.
+ENGINES = ("cursor", "claude")
+DEFAULT_CLAUDE_MODEL = "claude-sonnet-5-5"
 
 
 def _bool(name: str, default: bool) -> bool:
@@ -32,6 +35,11 @@ def _int(name: str, default: int, minimum: int = 0) -> int:
 
 def _patterns(raw: str) -> tuple[str, ...]:
     return tuple(item.strip().lower() for item in raw.replace("\n", ",").split(",") if item.strip())
+
+
+def _engine(raw: str) -> str:
+    value = (raw or "").strip().lower()
+    return value if value in ENGINES else ""
 
 
 def _profile(raw: str) -> str:
@@ -64,8 +72,25 @@ class Settings:
     # Hosts (fnmatch patterns on the ssh alias or its HostName) where a job pauses for a human first.
     ssh_approval_hosts: tuple[str, ...] = ()
     ssh_approval_timeout: int = 900
-    # Let MCP callers approve with the cursor_approve tool. Off: the calling model could approve itself.
+    # Let MCP callers approve with the agent_approve tool. Off: the calling model could approve itself.
     approval_tool: bool = False
+    # Claude Code (claude-agent-sdk): a Claude Plan token (sk-ant-oat…, `claude setup-token`) or an
+    # Anthropic API key. Without either, a token from "Sign in with Claude" in DATA_DIR is used.
+    claude_oauth_token: str = ""
+    anthropic_api_key: str = ""
+    claude_model: str = DEFAULT_CLAUDE_MODEL
+    # Engine for jobs that do not name one. Empty: cursor, or claude when only Claude is set up.
+    default_engine: str = ""
+
+    @property
+    def claude_token_path(self) -> Path:
+        """Where "Sign in with Claude" keeps the Plan token (owner-only file in the data volume)."""
+        return self.data_dir / "claude" / "oauth-token"
+
+    @property
+    def claude_config_dir(self) -> Path:
+        """Claude Code's own state (sessions for resume). Never the user's ~/.claude."""
+        return self.data_dir / "claude" / "config"
 
     def needs_approval(self, *names: str) -> bool:
         from fnmatch import fnmatchcase
@@ -116,6 +141,10 @@ class Settings:
             ssh_approval_hosts=_patterns(os.environ.get("SSH_APPROVAL_HOSTS", "")),
             ssh_approval_timeout=_int("SSH_APPROVAL_TIMEOUT", 900, 10),
             approval_tool=_bool("APPROVAL_TOOL", False),
+            claude_oauth_token=os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip(),
+            anthropic_api_key=os.environ.get("ANTHROPIC_API_KEY", "").strip(),
+            claude_model=os.environ.get("CLAUDE_MODEL", "").strip() or DEFAULT_CLAUDE_MODEL,
+            default_engine=_engine(os.environ.get("DEFAULT_ENGINE", "")),
         )
 
 

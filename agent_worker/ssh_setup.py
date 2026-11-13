@@ -18,7 +18,7 @@ import stat
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from cursor_worker.settings import Settings
+from agent_worker.settings import Settings
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +82,7 @@ def setup_ssh(home: Path | None = None, env: dict[str, str] | None = None) -> Ss
     git_key = git_key if "PRIVATE KEY" in git_key else ""
     try:
         ssh_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        probe = ssh_dir / ".cursor-worker-probe"
+        probe = ssh_dir / ".agent-worker-probe"
         probe.write_text("")
         probe.unlink()
     except OSError:
@@ -114,7 +114,7 @@ def setup_ssh(home: Path | None = None, env: dict[str, str] | None = None) -> Ss
     if user_config:
         _write_private(ssh_dir / "config.d" / "user", user_config)
     # ssh keeps the first value it finds, so the user's config comes first and these are fallbacks.
-    lines = ["# Written by cursor-worker at start. Put your own settings in SSH_CONFIG.", ""]
+    lines = ["# Written by agent-worker at start. Put your own settings in SSH_CONFIG.", ""]
     if user_config:
         lines.append(f"Include {ssh_dir / 'config.d' / 'user'}")
         lines.append("")
@@ -152,5 +152,5 @@ def prepare_environment(settings: Settings) -> None:
     path = os.environ.get("PATH", "")
     if not path.startswith(str(BIN_DIR)):
         os.environ["PATH"] = f"{BIN_DIR}{os.pathsep}{path}" if path else str(BIN_DIR)
-    os.environ["CURSOR_WORKER_URL"] = f"http://127.0.0.1:{settings.port}"
-    os.environ["CURSOR_WORKER_APPROVAL_TIMEOUT"] = str(settings.ssh_approval_timeout)
+    os.environ["AGENT_WORKER_URL"] = f"http://127.0.0.1:{settings.port}"
+    os.environ["AGENT_WORKER_APPROVAL_TIMEOUT"] = str(settings.ssh_approval_timeout)

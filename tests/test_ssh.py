@@ -16,11 +16,11 @@ import pytest
 from mcp import Client
 from mcp import types as mtypes
 
-from cursor_worker.app import create_app
-from cursor_worker.jobs import JobError, JobManager, JobRequest, Store
-from cursor_worker.mcp_server import build_mcp
-from cursor_worker.remote_guard import parse_ssh, scp_hosts
-from cursor_worker.ssh_setup import BIN_DIR, setup_ssh
+from agent_worker.app import create_app
+from agent_worker.jobs import JobError, JobManager, JobRequest, Store
+from agent_worker.mcp_server import build_mcp
+from agent_worker.remote_guard import parse_ssh, scp_hosts
+from agent_worker.ssh_setup import BIN_DIR, setup_ssh
 
 KEY = "-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----"
 
@@ -233,7 +233,7 @@ async def test_mcp_elicitation_asks_the_user(settings, engine):
         return mtypes.ElicitResult(action="accept", content={"approve": True, "note": ""})
 
     async with Client(build_mcp(manager), elicitation_callback=elicit) as client:
-        data = (await client.call_tool("cursor_agent", {"task": "reboot prod"})).structured_content
+        data = (await client.call_tool("agent_run", {"task": "reboot prod"})).structured_content
     assert data["status"] == "succeeded"
     assert results == [(True, "")]
     assert "reboot" in asked[0] and "root@prod" in asked[0]
@@ -245,18 +245,18 @@ async def test_mcp_without_elicitation_reports_needs_approval(settings, engine):
     engine.hook = _ssh_hook(manager, results)
     async with Client(build_mcp(manager)) as client:
         names = {t.name for t in (await client.list_tools()).tools}
-        assert "cursor_approve" in names
-        first = (await client.call_tool("cursor_agent", {"task": "reboot prod"})).structured_content
+        assert "agent_approve" in names
+        first = (await client.call_tool("agent_run", {"task": "reboot prod"})).structured_content
         assert first["status"] == "needs_approval" and first["approval"]["host"] == "prod"
         assert "Do not decide yourself" in first["hint"]
-        done = (await client.call_tool("cursor_approve", {"job_id": first["job_id"], "approve": False})).structured_content
+        done = (await client.call_tool("agent_approve", {"job_id": first["job_id"], "approve": False})).structured_content
     assert done["status"] == "succeeded"
     assert results[0][0] is False
 
 
 async def test_approve_tool_is_off_by_default(settings, engine):
     async with Client(build_mcp(_manager(settings, engine))) as client:
-        assert "cursor_approve" not in {t.name for t in (await client.list_tools()).tools}
+        assert "agent_approve" not in {t.name for t in (await client.list_tools()).tools}
 
 
 # ---- Open WebUI: answer in the chat ------------------------------------------------------------
@@ -332,10 +332,10 @@ def fake_world(tmp_path):
     env = {
         **os.environ,
         "PATH": f"{BIN_DIR}{os.pathsep}{real}{os.pathsep}{os.environ['PATH']}",
-        "CURSOR_WORKER_URL": f"http://127.0.0.1:{server.server_port}",
-        "CURSOR_WORKER_WORKSPACE": "default",
+        "AGENT_WORKER_URL": f"http://127.0.0.1:{server.server_port}",
+        "AGENT_WORKER_WORKSPACE": "default",
     }
-    env.pop(f"CURSOR_WORKER_GUARD_DONE", None)
+    env.pop(f"AGENT_WORKER_GUARD_DONE", None)
     yield env
     server.shutdown()
 
@@ -360,14 +360,14 @@ def test_guard_refuses_when_denied(fake_world):
 
 
 def test_guard_fails_closed_without_the_worker(fake_world):
-    env = {**fake_world, "CURSOR_WORKER_URL": "http://127.0.0.1:9"}
+    env = {**fake_world, "AGENT_WORKER_URL": "http://127.0.0.1:9"}
     out = _run(env, "ssh", "web01", "uptime")
     assert out.returncode == 255 and "could not reach" in out.stderr
 
 
 def test_guard_passes_through_info_calls_and_outside_the_worker(fake_world):
     assert _run(fake_world, "ssh", "-V").stdout.startswith("REAL ssh -V")
-    env = {k: v for k, v in fake_world.items() if k != "CURSOR_WORKER_URL"}
+    env = {k: v for k, v in fake_world.items() if k != "AGENT_WORKER_URL"}
     assert _run(env, "ssh", "web01", "x").stdout.startswith("REAL ssh")
     assert _Worker.calls == []
 

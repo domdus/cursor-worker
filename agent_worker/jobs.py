@@ -13,10 +13,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator
 
-from cursor_worker.engine import Engine, EngineError, RunSpec
-from cursor_worker.mcp_config import McpConfigError, load_mcp_servers, servers_from_request, with_depth
-from cursor_worker.settings import Settings, narrow_profile, touches_files
-from cursor_worker.workspaces import WorkspaceError, resolve
+from agent_worker.engine import Engine, EngineError, RunSpec
+from agent_worker.mcp_config import McpConfigError, load_mcp_servers, servers_from_request, with_depth
+from agent_worker.settings import Settings, narrow_profile, touches_files
+from agent_worker.workspaces import WorkspaceError, resolve
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +50,7 @@ class JobRequest:
     instructions: str = ""
     depth: int = 0
     origin: str = "api"
+    engine: str = ""
 
 
 @dataclass
@@ -61,6 +62,7 @@ class Job:
     model: str
     profile: str
     origin: str
+    engine: str = "cursor"
     status: str = "queued"
     created_at: str = field(default_factory=_now)
     started_at: str = ""
@@ -89,6 +91,7 @@ class Job:
         return {
             "id": self.id,
             "status": self.status,
+            "engine": self.engine,
             "workspace": self.workspace,
             "session": self.session or None,
             "model": self.model,
@@ -213,6 +216,7 @@ class JobManager:
                 model=data.get("model") or "",
                 profile=data.get("tools") or "",
                 origin=data.get("origin") or "api",
+                engine=data.get("engine") or "cursor",
                 status=data.get("status") or "failed",
                 created_at=data.get("created_at") or _now(),
                 started_at=data.get("started_at") or "",
@@ -239,7 +243,7 @@ class JobManager:
     def _build(self, req: JobRequest, job_id: str) -> RunSpec:
         if req.depth >= self.settings.max_call_depth:
             raise JobError(
-                "This call came from a Cursor worker agent. Nested worker jobs are refused (MAX_CALL_DEPTH).",
+                "This call came from an agent worker job. Nested worker jobs are refused (MAX_CALL_DEPTH).",
                 status=409,
             )
         task = (req.task or "").strip()
@@ -248,6 +252,11 @@ class JobManager:
         try:
             name, path = resolve(self.settings, req.workspace)
         except WorkspaceError as exc:
+            raise JobError(str(exc)) from exc
+        pick = getattr(self.engine, "pick", None)
+        try:
+            engine = pick(req.engine) if callable(pick) else "cursor"
+        except EngineError as exc:
             raise JobError(str(exc)) from exc
         if req.mcp_servers and not self.settings.allow_request_mcp:
             raise JobError("This worker does not accept MCP servers with a job (ALLOW_REQUEST_MCP=false).")
@@ -269,7 +278,12 @@ class JobManager:
             images=list(req.images or []),
             context=req.context,
             instructions=req.instructions,
+            engine=engine,
         )
+
+    def default_model(self, engine: str) -> str:
+        model_for = getattr(self.engine, "model_for", None)
+        return (model_for(engine) if callable(model_for) else "") or self.settings.model
 
     def submit(self, req: JobRequest) -> Job:
         job_id = uuid.uuid4().hex[:16]
@@ -279,9 +293,10 @@ class JobManager:
             task=spec.task,
             workspace=spec.workspace,
             session=spec.session,
-            model=spec.model or self.settings.model,
+            model=spec.model or self.default_model(spec.engine),
             profile=spec.profile,
             origin=req.origin,
+            engine=spec.engine,
         )
         self.jobs[job.id] = job
         self.store.save(job)
@@ -289,8 +304,8 @@ class JobManager:
         job.task_handle = asyncio.create_task(self._run(job, spec), name=f"job-{job.id}")
         job.task_handle.add_done_callback(lambda _t, job=job: self._settle(job))
         logger.info(
-            "job %s queued workspace=%s session=%s tools=%s origin=%s",
-            job.id, job.workspace, job.session or "-", job.profile, job.origin,
+            "job %s queued engine=%s workspace=%s session=%s tools=%s origin=%s",
+            job.id, job.engine, job.workspace, job.session or "-", job.profile, job.origin,
         )
         return job
 
